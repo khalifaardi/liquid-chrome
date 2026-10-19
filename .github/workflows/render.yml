@@ -1,0 +1,82 @@
+name: render
+
+on:
+  workflow_dispatch:
+    inputs:
+      fps:
+        description: "Frame rate"
+        default: "60"
+      quality:
+        description: "draft | standard | high"
+        default: "standard"
+      workers:
+        description: "Parallel Chrome workers (runner has 4 cores; 3-4 is the sweet spot)"
+        default: "4"
+  push:
+    branches: [main]
+    paths-ignore:
+      - "renders/**"
+      - "README.md"
+
+concurrency:
+  group: render-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+
+      - name: Install Playwright Chromium
+        run: |
+          npm init -y >/dev/null 2>&1 || true
+          npm i -D playwright@1 >/dev/null
+          npx playwright install --with-deps chromium
+
+      - name: Runner specs (for the record)
+        run: |
+          nproc
+          free -h
+          ffmpeg -version | head -1
+
+      - name: Lint
+        run: npx --yes hyperframes@0.8.176 lint
+
+      - name: Render
+        env:
+          FPS: ${{ github.event.inputs.fps || '60' }}
+          QUALITY: ${{ github.event.inputs.quality || 'standard' }}
+          WORKERS: ${{ github.event.inputs.workers || '4' }}
+        run: |
+          mkdir -p renders
+          time npx --yes hyperframes@0.8.176 render \
+            --fps "$FPS" \
+            --quality "$QUALITY" \
+            --workers "$WORKERS" \
+            --output "renders/liquid-chrome-${FPS}fps.mp4"
+
+      - name: Verify output
+        run: |
+          f="renders/liquid-chrome-${{ github.event.inputs.fps || '60' }}fps.mp4"
+          test -s "$f"
+          ffprobe -v error -show_entries format=duration \
+            -show_entries stream=width,height,r_frame_rate,nb_frames \
+            -of default=nw=1 "$f"
+
+      - name: Upload MP4
+        uses: actions/upload-artifact@v4
+        with:
+          name: liquid-chrome-${{ github.event.inputs.fps || '60' }}fps
+          path: renders/*.mp4
+          retention-days: 14
