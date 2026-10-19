@@ -116,6 +116,16 @@
         const s = Math.min(ATLAS_W / (totalW * 1.06), ATLAS_H / (capH * 1.9));
         const cx = ATLAS_W / 2, cy = ATLAS_H / 2;
 
+        // Vertically centre the word on its own INK box. Placing the baseline at the atlas
+        // centre pushed cap-height glyphs (y up to 1040) past the top edge (py went to -17),
+        // so every letter was clipped at the top and edge-clamped into a "dripping" shape.
+        let inkMinY = 1e9, inkMaxY = -1e9;
+        glyphs.forEach((g) => g.paths.forEach((p) => p.pts.forEach(([, y]) => {
+          if (y < inkMinY) inkMinY = y;
+          if (y > inkMaxY) inkMaxY = y;
+        })));
+        const inkMidY = (inkMinY + inkMaxY) / 2;
+
         const cv = document.createElement("canvas");
         cv.width = ATLAS_W; cv.height = ATLAS_H;
         const ctx = cv.getContext("2d", { willReadFrequently: true });
@@ -126,7 +136,7 @@
           for (const p of gl.paths) {
             p.pts.forEach(([x, y], idx) => {
               const px = cx + (x + gl.penX + xOff) * s;
-              const py = cy - y * s;
+              const py = cy - (y - inkMidY) * s;
               idx ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
             });
             ctx.closePath();
@@ -166,19 +176,32 @@
           }
           return D;
         };
-        const dOut = chamfer(inside);                       // distance from outside, 0 inside
-        const inverted = new Uint8Array(N);
-        for (let i = 0; i < N; i++) inverted[i] = inside[i] ? 0 : 1;
-        const dIn = chamfer(inverted);                      // distance from inside, 0 outside
+        // chamfer() returns 0 AT THE SEEDS and grows with distance from them.
+        // dOut: distance to the nearest OUTSIDE pixel -> seed the OUTSIDE pixels.
+        // dIn : distance to the nearest INSIDE  pixel -> seed the INSIDE  pixels.
+        // These were swapped, so every inside pixel stored the MAXIMUM distance,
+        // saturating to 255 and leaving a one-texel transition -> wobbly glyph edges.
+        const outsideSeed = new Uint8Array(N);
+        for (let i = 0; i < N; i++) outsideSeed[i] = inside[i] ? 0 : 1;
+        const dOut = chamfer(outsideSeed);   // 0 outside, grows inward
+        const dIn  = chamfer(inside);        // 0 inside,  grows outward
 
         // Encode distance in WORLD units. Encoding in atlas px capped the far field at
         // 10px = 0.019 world units, which made the SDF nearly flat and read as "inside"
         // everywhere. 0.35 world units (~181 atlas px) covers well past any glyph interior.
-        const RANGE_WORLD = 0.35;
+        // 0.06 world units of accurate range: the raymarcher only needs precision NEAR the
+        // surface, and a tight range makes 1 texel level 0.12 atlas px instead of 0.71,
+        // which is what removes the wobbly/jagged glyph edges.
+        const RANGE_WORLD = 0.06;
         const RANGE_PX = RANGE_WORLD * s;
         const tex = new Uint8Array(N * 4);
         for (let i = 0; i < N; i++) {
-          const distPx = (inside[i] ? dIn[i] : dOut[i]) / 3;
+          // A pixel's distance-to-nearest-edge is always measured to the OPPOSITE region:
+          //   inside  pixel -> nearest OUTSIDE pixel  (dOut)
+          //   outside pixel -> nearest INSIDE  pixel  (dIn)
+          // Reading dIn for inside pixels returned 0 (dIn is seeded ON them), which stored
+          // a flat zero field across every stroke and left a single-texel edge -> wobble.
+          const distPx = (inside[i] ? dOut[i] : dIn[i]) / 3;
           const v = Math.max(0, Math.min(255, Math.round((distPx / RANGE_PX) * 255)));
           tex[i * 4] = v;                       // R: unsigned distance, 0 = surface
           tex[i * 4 + 1] = inside[i] ? 255 : 0; // G: inside mask
@@ -206,9 +229,12 @@
             ch: g.ch,
             u0: Math.max(0, cx + wx(minX - PAD) * s) / ATLAS_W,
             u1: Math.min(ATLAS_W, cx + wx(maxX + PAD) * s) / ATLAS_W,
-            v0: Math.max(0, cy - (maxY + PAD) * s) / ATLAS_H,
-            v1: Math.min(ATLAS_H, cy - (minY - PAD) * s) / ATLAS_H,
-            cwx: wx((minX + maxX) / 2), cwy: (minY + maxY) / 2,
+            // v0 = BOTTOM of the padded rect, v1 = TOP. minY is the glyph's bottom, which
+            // maps to a LARGER pixel row (pixel y grows downward), so v0 > v1 numerically.
+            // The previous order put the TOP in v0, which flipped and squashed every glyph.
+            v0: Math.min(ATLAS_H, cy - (minY - inkMidY - PAD) * s) / ATLAS_H,
+            v1: Math.max(0, cy - (maxY - inkMidY + PAD) * s) / ATLAS_H,
+            cwx: wx((minX + maxX) / 2), cwy: (minY + maxY) / 2 - inkMidY,
             hw: (maxX - minX) / 2 + PAD, hh: (maxY - minY) / 2 + PAD,
           };
         });
@@ -250,19 +276,35 @@
           if (abs(p.z) > halfDepth + 0.25) return abs(p.z) - halfDepth;
           float best = 1e5;     // nearest OUTSIDE distance
           float bestIn = 1e5;   // nearest INSIDE distance
+          float bestOwner = 1e5;
           for (int i = 0; i < 7; i++){
             if (i >= uGlyphCount) break;
             vec4 g  = uGlyph[i];       // u0,v0,u1,v1 atlas rect
-            vec4 gc = uGlyphC[i];      // centre x,y, half halfSize x,y (world)
+            vec4 gc = uGlyphC[i];      // centre x,y, half size x,y (world)
             vec2 rel = vec2(p.x - gc.x, p.y - gc.y);
+            // Only the glyph that OWNS this point may vote on its sign. Padded rects can
+            // overlap between neighbours, so pick the nearest rect centre; a point inside
+            // O's counter is NOT inside P just because P's padding reaches it.
+            float ownerDist = length(rel / max(vec2(gc.z, gc.w), vec2(1e-4)));
             if (abs(rel.x) > gc.z*1.5 || abs(rel.y) > gc.w*2.0) continue;
+            if (ownerDist > bestOwner) continue;
+            bestOwner = ownerDist;
+            best = 1e5; bestIn = 1e5;
 
             // world -> atlas uv within this glyph's rect
             float u = g.x + (rel.x/(gc.z*2.0) + 0.5) * (g.z - g.x);
             float v = g.y + (rel.y/(gc.w*2.0) + 0.5) * (g.w - g.y);
             // atlas R = unsigned distance over 0.35 world units; G = inside mask
             vec4 tx = texture2D(uSDF, vec2(u,v));
-            float d = tx.r * 0.35;
+            float d = tx.r * 0.06;
+            // texel is clamped at 0.06, so once we are outside that band the true distance
+            // is at least the analytic distance to this glyph's padded box. Using the box
+            // keeps the raymarcher from stalling on a constant far field.
+            vec2 boxD = abs(rel) - vec2(gc.z, gc.w);
+            float boxDist = (boxD.x <= 0.0 && boxD.y <= 0.0)
+                          ? 0.0
+                          : length(max(boxD, 0.0));
+            if (d >= 0.0599) d = max(d, boxDist);
             if (tx.g > 0.5) bestIn = min(bestIn, d);
             else            best   = min(best, d);
           }
@@ -271,7 +313,7 @@
           float dFlat;
           if (bestIn < best) dFlat = -bestIn;
           else if (best < 1e4) dFlat = best;
-          else dFlat = 0.35;
+          else dFlat = 0.06;
           // Standard 2D->3D round extrusion. The previous bespoke bevel added the bevel
           // into the flat distance AND subtracted it again, which stretched the glyphs
           // into vertical "drip legs" instead of a clean slab.
@@ -334,7 +376,10 @@
           // blend: blob -> droplets -> letters
           d = dBlob;
           d = mix(d, smin(dBlob, dDrops, uSmoothK), smoothstep(0.0, 0.15, dropW));
-          d = mix(d, smin(dText, dDrops*step(dropW,0.01), uSmoothK), letterW);
+          // Letters must stay discrete: blending the glyph union with the droplets at
+          // k=0.35 bridged neighbouring letters into one continuous mass. Use the prompt's
+          // "falls to 0.1" low end while letters are showing.
+          d = mix(d, smin(dText, dDrops*step(dropW,0.01), 0.06), letterW);
           // melt back to a single blob
           float dMelt = length(p) - br * 0.98;
           d = mix(d, dMelt, meltW);
@@ -397,13 +442,16 @@
           vec2 uv = (gl_FragCoord.xy - 0.5*uRes) / uRes.y;
           vec3 ro = uCamPos;
           vec3 fw = normalize(uCamTarget - ro);
-          vec3 rt = normalize(cross(vec3(0.0, 1.0, 0.0), fw));
-          vec3 up = cross(fw, rt);
-          // 42deg total fov. The prompt's "30 degree lens" cannot fit the prompt's own
-          // text at its own closest dolly: at 30deg and d=5.6 the frame shows 3.00 world
-          // units, but "OPUS 5.5" at size 0.52 / -0.04em tracking is 3.135 wide. 42deg
-          // also leaves margin for the +-7deg orbit, which foreshortens a flat word.
-          float focal = 1.0 / tan(radians(21.0));
+          // Right-handed basis for a camera looking along fw. cross(worldUp, fw) points
+          // -X when the camera looks down -Z, which MIRRORED the whole scene horizontally
+          // (the text rendered as "5.5 SUqO"). cross(fw, worldUp) is the correct screen-right.
+          vec3 rt = normalize(cross(fw, vec3(0.0, 1.0, 0.0)));
+          vec3 up = cross(rt, fw);
+          // uv spans -0.5..0.5, so focal = 0.5 / tan(halfFov). Using 1.0/tan(21deg) made the
+          // REAL half-angle atan(tan(21)*0.5)=10.9deg (a 21.7deg lens, not 42deg), which
+          // cropped "OPUS 5.5" at both edges. halfFov 20deg -> 40deg lens, 1.3x margin at the
+          // closest dolly of 5.6 while still fitting the +-7deg orbit.
+          float focal = 0.5 / tan(radians(20.0));
           vec3 rd = normalize(fw * focal + rt * uv.x + up * uv.y);
           float t = 0.0, d = 0.0, matId = 0.0;
           for (int i = 0; i < 96; i++){
@@ -481,7 +529,7 @@
             uGlyphCount: { value: Math.min(7, atlas.rects.length) },
             uSmoothK: { value: 0.35 },
             uCamPos: { value: new THREE.Vector3(0, 0.15, 5.6) },
-            uCamTarget: { value: new THREE.Vector3(0, 0.26, 0) },
+            uCamTarget: { value: new THREE.Vector3(0, 0.0, 0) },
             uGlint: { value: -1 },
             uMeshW: { value: 0 },
             uSeed: { value: 0 },
@@ -519,7 +567,7 @@
 
           const cp = cameraAt(t);
           material.uniforms.uCamPos.value.copy(cp);
-          material.uniforms.uCamTarget.value.set(0, 0.26, 0);
+          material.uniforms.uCamTarget.value.set(0, 0.0, 0);
           material.uniforms.uT.value = t;
           material.uniforms.uSeed.value = frame;
           // glint sweep 3.3 -> 4.1
